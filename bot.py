@@ -115,6 +115,10 @@ class AdminStates(StatesGroup):
     managing_faq = State()
     editing_faq_text = State()
 
+    # Редактирование сообщения подтверждения
+    managing_confirmation = State()
+    editing_confirmation_text = State()
+
 # ---------- КЛАВИАТУРЫ ----------
 def main_keyboard():
     return types.ReplyKeyboardMarkup(
@@ -134,6 +138,7 @@ def admin_keyboard():
             [types.KeyboardButton(text="📅 Редактировать окна")],
             [types.KeyboardButton(text="💼 Управление услугами")],
             [types.KeyboardButton(text="📝 Редактировать ЧаВо")],
+            [types.KeyboardButton(text="📩 Сообщение подтверждения")],
             [types.KeyboardButton(text="📋 Все записи")],
             [types.KeyboardButton(text="📊 Клиенты")],
         ],
@@ -317,12 +322,23 @@ async def time_chosen(callback: types.CallbackQuery, state: FSMContext):
     service = session.query(Service).get(service_id)
     slot = session.query(ScheduleSlot).get(slot_id)
     if service.prepayment_required:
-        text = (f"Вы выбрали:\n"
-                f"Услуга: {service.name}\n"
-                f"Дата: {data['date']}\n"
-                f"Время: {slot.time}\n\n"
-                f"Для подтверждения записи необходимо внести предоплату {service.prepayment_amount} руб.\n"
-                f"Переведите на карту 1234 5678 9012 3456 и отправьте скриншот чека.")
+        # Читаем текст сообщения подтверждения из базы
+        confirmation = session.query(Setting).filter(Setting.key == 'confirmation_text').first()
+        if confirmation:
+            text = confirmation.value.format(
+                service_name=service.name,
+                date=data['date'],
+                time=slot.time,
+                prepayment_amount=service.prepayment_amount
+            )
+        else:
+            # Fallback на старый текст
+            text = (f"Вы выбрали:\n"
+                    f"Услуга: {service.name}\n"
+                    f"Дата: {data['date']}\n"
+                    f"Время: {slot.time}\n\n"
+                    f"Для подтверждения записи необходимо внести предоплату {service.prepayment_amount} руб.\n"
+                    f"Переведите на карту 1234 5678 9012 3456 и отправьте скриншот чека.")
         await callback.message.edit_text(text, reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
             [types.InlineKeyboardButton(text="Я отправил(а) скриншот", callback_data="sent_screenshot")]
         ]))
@@ -335,7 +351,10 @@ async def time_chosen(callback: types.CallbackQuery, state: FSMContext):
         session.commit()
         await callback.message.edit_text("Запись создана! Ожидайте подтверждения мастера.")
         for admin_id in ADMIN_IDS:
-            await bot.send_message(admin_id, f"🆕 Новая запись!\nКлиент: {user.full_name} (@{user.username})\nУслуга: {service.name}\nДата: {data['date']}\nВремя: {slot.time}")
+            try:
+                await bot.send_message(admin_id, f"🆕 Новая запись!\nКлиент: {user.full_name} (@{user.username})\nУслуга: {service.name}\nДата: {data['date']}\nВремя: {slot.time}")
+            except Exception as e:
+                logging.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
         await state.clear()
     session.close()
 
@@ -359,8 +378,13 @@ async def screenshot_received(message: types.Message, state: FSMContext):
     session.add(appointment)
     session.commit()
     await message.answer("Спасибо! Ваша запись ожидает подтверждения мастера.")
+    if not ADMIN_IDS:
+        logging.warning("ADMIN_IDS пуст, скриншот не отправлен")
     for admin_id in ADMIN_IDS:
-        await bot.send_photo(admin_id, file_id, caption=f"🧾 Предоплата от {user.full_name} (@{user.username})\nУслуга: {service.name}\nДата: {data['date']}\nВремя: {slot.time}\nСумма: {service.prepayment_amount} руб.")
+        try:
+            await bot.send_photo(admin_id, file_id, caption=f"🧾 Предоплата от {user.full_name} (@{user.username})\nУслуга: {service.name}\nДата: {data['date']}\nВремя: {slot.time}\nСумма: {service.prepayment_amount} руб.")
+        except Exception as e:
+            logging.error(f"Не удалось отправить скриншот админу {admin_id}: {e}")
     await state.clear()
     session.close()
 
@@ -461,6 +485,15 @@ async def change_slot_date(message: types.Message, state: FSMContext):
         return
     slot.date = new_date
     session.commit()
+    # Если слот забронирован, уведомим клиента (опционально)
+    if slot.is_booked:
+        appt = session.query(Appointment).filter(Appointment.schedule_id == slot_id).first()
+        if appt:
+            client = session.query(User).get(appt.user_id)
+            try:
+                await bot.send_message(client.telegram_id, f"⚠️ Ваша запись перенесена на новую дату: {new_date} {slot.time}")
+            except Exception as e:
+                logging.error(f"Не удалось уведомить клиента {client.telegram_id}: {e}")
     session.close()
     await message.answer("Готово!")
     await state.clear()
@@ -490,6 +523,14 @@ async def change_slot_time(message: types.Message, state: FSMContext):
         return
     slot.time = new_time
     session.commit()
+    if slot.is_booked:
+        appt = session.query(Appointment).filter(Appointment.schedule_id == slot_id).first()
+        if appt:
+            client = session.query(User).get(appt.user_id)
+            try:
+                await bot.send_message(client.telegram_id, f"⚠️ Время вашей записи изменено: {slot.date} {new_time}")
+            except Exception as e:
+                logging.error(f"Не удалось уведомить клиента {client.telegram_id}: {e}")
     session.close()
     await message.answer("Готово!")
     await state.clear()
@@ -501,12 +542,17 @@ async def delete_slot(callback: types.CallbackQuery, state: FSMContext):
     slot_id = data['editing_slot_id']
     session = SessionLocal()
     slot = session.query(ScheduleSlot).get(slot_id)
-    if slot and slot.is_booked:
-        await callback.message.answer("Нельзя удалить забронированный слот.")
-        session.close()
-        await state.clear()
-        return
     if slot:
+        # Если слот забронирован, удалим связанную запись и уведомим клиента
+        if slot.is_booked:
+            appt = session.query(Appointment).filter(Appointment.schedule_id == slot_id).first()
+            if appt:
+                client = session.query(User).get(appt.user_id)
+                try:
+                    await bot.send_message(client.telegram_id, "⚠️ Ваша запись была отменена администратором.")
+                except Exception as e:
+                    logging.error(f"Не удалось уведомить клиента {client.telegram_id}: {e}")
+                session.delete(appt)
         session.delete(slot)
         session.commit()
         await callback.message.edit_text("Готово!")
@@ -744,9 +790,14 @@ async def delete_service(callback: types.CallbackQuery, state: FSMContext):
     session = SessionLocal()
     service = session.query(Service).get(service_id)
     if service:
-        session.delete(service)
-        session.commit()
-        await callback.message.answer("Готово!")
+        # Проверим, есть ли связанные записи
+        has_appointments = session.query(Appointment).filter(Appointment.service_id == service_id).count() > 0
+        if has_appointments:
+            await callback.message.answer("Нельзя удалить услугу, так как есть записи. Сначала удалите или перенесите записи.")
+        else:
+            session.delete(service)
+            session.commit()
+            await callback.message.answer("Готово!")
     else:
         await callback.message.answer("Услуга не найдена.")
     session.close()
@@ -789,6 +840,57 @@ async def faq_save(message: types.Message, state: FSMContext):
         setting.value = new_text
     else:
         session.add(Setting(key='faq_text', value=new_text))
+    session.commit()
+    session.close()
+    await message.answer("Готово!")
+    await state.clear()
+
+# ---------- РЕДАКТИРОВАНИЕ СООБЩЕНИЯ ПОДТВЕРЖДЕНИЯ ----------
+@dp.message(F.text == "📩 Сообщение подтверждения")
+async def edit_confirmation_start(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="✏️ Редактировать", callback_data="conf_edit")],
+        [types.InlineKeyboardButton(text="❌ Отмена", callback_data="conf_cancel")],
+    ])
+    await message.answer("Выберите действие:", reply_markup=keyboard)
+    await state.set_state(AdminStates.managing_confirmation)
+
+@dp.callback_query(AdminStates.managing_confirmation, F.data == "conf_edit")
+async def confirmation_edit_prompt(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.answer(
+        "Введите новый текст сообщения подтверждения.\n"
+        "Можно использовать переменные:\n"
+        "{service_name} — название услуги\n"
+        "{date} — дата\n"
+        "{time} — время\n"
+        "{prepayment_amount} — сумма предоплаты\n\n"
+        "Пример:\n"
+        "Услуга: {service_name}\nДата: {date}\nВремя: {time}\nПредоплата: {prepayment_amount} руб.\nПереведите на карту 1234 5678 9012 3456 и отправьте скриншот."
+    )
+    await state.set_state(AdminStates.editing_confirmation_text)
+
+@dp.callback_query(AdminStates.managing_confirmation, F.data == "conf_cancel")
+async def confirmation_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.edit_text("Отменено.")
+    await state.clear()
+
+@dp.message(AdminStates.editing_confirmation_text)
+async def confirmation_save(message: types.Message, state: FSMContext):
+    new_text = message.text.strip()
+    if not new_text:
+        await message.answer("Текст не может быть пустым. Попробуйте ещё раз:")
+        return
+    session = SessionLocal()
+    setting = session.query(Setting).filter(Setting.key == 'confirmation_text').first()
+    if setting:
+        setting.value = new_text
+    else:
+        session.add(Setting(key='confirmation_text', value=new_text))
     session.commit()
     session.close()
     await message.answer("Готово!")
@@ -841,6 +943,7 @@ async def show_clients(message: types.Message):
 # ---------- ЗАПУСК ----------
 async def main():
     session = SessionLocal()
+    # Добавляем дефолтные настройки, если их нет
     if session.query(Setting).filter(Setting.key == 'faq_text').first() is None:
         default_faq = (
             "Часто задаваемые вопросы:\n\n"
@@ -849,6 +952,17 @@ async def main():
             "❓ Можно ли мочить глаза?\n— В первые 24 часа не рекомендуется."
         )
         session.add(Setting(key='faq_text', value=default_faq))
+        session.commit()
+    if session.query(Setting).filter(Setting.key == 'confirmation_text').first() is None:
+        default_confirmation = (
+            "Вы выбрали:\n"
+            "Услуга: {service_name}\n"
+            "Дата: {date}\n"
+            "Время: {time}\n\n"
+            "Для подтверждения записи необходимо внести предоплату {prepayment_amount} руб.\n"
+            "Переведите на карту 1234 5678 9012 3456 и отправьте скриншот чека."
+        )
+        session.add(Setting(key='confirmation_text', value=default_confirmation))
         session.commit()
     if session.query(Service).count() == 0:
         services = [
