@@ -74,7 +74,7 @@ class Setting(Base):
 engine = create_engine('sqlite:///bot.db', connect_args={"check_same_thread": False})
 Base.metadata.create_all(engine)
 
-# Добавляем столбец client_notes, если его нет (миграция)
+# Миграция: добавляем столбец client_notes, если его нет
 inspector = inspect(engine)
 columns = [col['name'] for col in inspector.get_columns('appointments')]
 if 'client_notes' not in columns:
@@ -99,19 +99,17 @@ class BookingStates(StatesGroup):
     choosing_date = State()
     choosing_time = State()
     waiting_screenshot = State()
+    after_consult = State()            # после консультации, ждём нажатия "Я написала"
 
 class AdminStates(StatesGroup):
-    # Добавление слотов
     adding_slot_date = State()
     adding_slot_time = State()
 
-    # Редактирование слотов
     editing_slot_list = State()
     editing_slot_choose_action = State()
     editing_slot_new_date = State()
     editing_slot_new_time = State()
 
-    # Управление услугами
     managing_services = State()
     adding_service_name = State()
     adding_service_description = State()
@@ -122,15 +120,12 @@ class AdminStates(StatesGroup):
     editing_service_field = State()
     editing_service_value = State()
 
-    # Редактирование текстов (общие состояния для каждого текста)
     editing_any_text = State()         # выбор, какой текст редактировать
     editing_any_text_value = State()   # ввод нового текста
 
-    # Внесение пожеланий клиента
-    entering_notes_select = State()    # выбор записи
-    entering_notes_value = State()     # ввод текста пожеланий
+    entering_notes_select = State()
+    entering_notes_value = State()
 
-    # Удаление всех записей (подтверждение)
     confirming_delete_all = State()
 
 # ---------- КЛАВИАТУРЫ ----------
@@ -292,11 +287,11 @@ async def show_my_appointments(message: types.Message):
         service = session.query(Service).get(app.service_id)
         slot = session.query(ScheduleSlot).get(app.schedule_id)
         date_display = format_date(slot.date)
-        text += f"📅 {date_display} в {slot.time} — {service.name}, статус: {app.status}\n"
+        text += f"📅 {date_display} в {slot.time} — {service.name}\n"
     await message.answer(text)
     session.close()
 
-# ---------- ЗАПИСЬ (НОВАЯ ЛОГИКА) ----------
+# ---------- ЗАПИСЬ ----------
 @dp.message(F.text == "📅 Записаться")
 async def start_booking(message: types.Message, state: FSMContext):
     session = SessionLocal()
@@ -315,7 +310,6 @@ async def service_chosen(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     service_id = int(callback.data.split("_")[1])
     await state.update_data(service_id=service_id)
-    # Показываем две кнопки: консультация или запись
     kb = inline_kb_3([
         types.InlineKeyboardButton(text="💬 Мне нужно посоветоваться", callback_data="intent_consult"),
         types.InlineKeyboardButton(text="✅ Я знаю что хочу", callback_data="intent_book")
@@ -326,7 +320,6 @@ async def service_chosen(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(BookingStates.choosing_intent, F.data == "intent_consult")
 async def intent_consult(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    # Отправляем клиенту текст консультации
     session = SessionLocal()
     consult_text = session.query(Setting).filter(Setting.key == 'consultation_text').first()
     session.close()
@@ -339,12 +332,29 @@ async def intent_consult(callback: types.CallbackQuery, state: FSMContext):
             await bot.send_message(admin_id, admin_msg)
         except Exception as e:
             logging.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
-    await state.clear()
+    # Показываем кнопку "Я написала"
+    kb = inline_kb_3([types.InlineKeyboardButton(text="✅ Я написала", callback_data="i_wrote")])
+    await callback.message.answer("После того как напишете администратору, нажмите кнопку ниже, чтобы продолжить запись.", reply_markup=kb)
+    await state.set_state(BookingStates.after_consult)
+
+@dp.callback_query(BookingStates.after_consult, F.data == "i_wrote")
+async def after_consult(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    # Переходим к выбору даты (пожелания не запрашиваем, т.к. клиент уже проконсультировался)
+    session = SessionLocal()
+    dates = session.query(ScheduleSlot.date).filter(ScheduleSlot.is_booked == False).distinct().order_by(ScheduleSlot.date).limit(20).all()
+    session.close()
+    if not dates:
+        await callback.message.answer("Свободных окон пока нет.")
+        await state.clear()
+        return
+    buttons = [types.InlineKeyboardButton(text=format_date(d[0]), callback_data=f"date_{d[0]}") for d in dates]
+    await callback.message.answer("Выберите дату:", reply_markup=inline_kb_3(buttons))
+    await state.set_state(BookingStates.choosing_date)
 
 @dp.callback_query(BookingStates.choosing_intent, F.data == "intent_book")
 async def intent_book(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    # Просим написать пожелания
     session = SessionLocal()
     wishes_text = session.query(Setting).filter(Setting.key == 'wishes_text').first()
     session.close()
@@ -353,7 +363,6 @@ async def intent_book(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(BookingStates.writing_wishes, F.photo | F.text)
 async def receive_wishes(message: types.Message, state: FSMContext):
-    # Сохраняем пожелания в состояние (текст или file_id фото)
     notes = ""
     photo_id = None
     if message.photo:
@@ -362,7 +371,6 @@ async def receive_wishes(message: types.Message, state: FSMContext):
     else:
         notes = message.text
     await state.update_data(client_notes=notes, client_photo=photo_id)
-    # Переходим к выбору даты
     session = SessionLocal()
     dates = session.query(ScheduleSlot.date).filter(ScheduleSlot.is_booked == False).distinct().order_by(ScheduleSlot.date).limit(20).all()
     session.close()
@@ -403,17 +411,14 @@ async def time_chosen(callback: types.CallbackQuery, state: FSMContext):
     slot = session.query(ScheduleSlot).get(slot_id)
     user = session.query(User).filter(User.telegram_id == callback.from_user.id).first()
 
-    # Бронируем слот
     slot.is_booked = True
     appointment = Appointment(user_id=user.id, service_id=service_id, schedule_id=slot_id, status='pending', client_notes=client_notes)
     session.add(appointment)
     session.commit()
 
-    # Отправляем клиенту первое сообщение с деталями
     date_display = format_date(slot.date)
     await callback.message.answer(f"Вы выбрали:\nУслуга: {service.name}\nДата: {date_display}\nВремя: {slot.time}")
 
-    # Второе сообщение – реквизиты (если требуется предоплата)
     if service.prepayment_required:
         conf_text = session.query(Setting).filter(Setting.key == 'confirmation_text').first()
         text = conf_text.value.format(service_name=service.name, date=date_display, time=slot.time, prepayment_amount=service.prepayment_amount) if conf_text else "Внесите предоплату."
@@ -421,13 +426,14 @@ async def time_chosen(callback: types.CallbackQuery, state: FSMContext):
         await state.update_data(appointment_id=appointment.id)
         await state.set_state(BookingStates.waiting_screenshot)
     else:
-        # Уведомляем админов с кнопками подтверждения
         for admin_id in ADMIN_IDS:
             kb = inline_kb_3([
                 types.InlineKeyboardButton(text="✅", callback_data=f"confirm_{appointment.id}"),
                 types.InlineKeyboardButton(text="❌", callback_data=f"reject_{appointment.id}")
             ])
-            msg = f"🆕 Новая запись\nКлиент: {user.full_name} (@{user.username})\nУслуга: {service.name}\nДата: {date_display} {slot.time}\nПожелания: {client_notes}"
+            msg = (f"🆕 Новая запись\nКлиент: {user.full_name} (@{user.username})\n"
+                   f"Услуга: {service.name}\nДата: {date_display} {slot.time}\n"
+                   f"Пожелания: {client_notes if client_notes else 'нет'}")
             try:
                 await bot.send_message(admin_id, msg, reply_markup=kb)
             except Exception as e:
@@ -435,7 +441,6 @@ async def time_chosen(callback: types.CallbackQuery, state: FSMContext):
         await state.clear()
     session.close()
 
-# Обработка скриншота после предоплаты
 @dp.message(BookingStates.waiting_screenshot, F.photo)
 async def screenshot_received(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -456,14 +461,20 @@ async def screenshot_received(message: types.Message, state: FSMContext):
     date_display = format_date(slot.date)
     await message.answer("Спасибо! Ваша запись ожидает подтверждения мастера.")
     for admin_id in ADMIN_IDS:
+        kb = inline_kb_3([
+            types.InlineKeyboardButton(text="✅", callback_data=f"confirm_{appointment.id}"),
+            types.InlineKeyboardButton(text="❌", callback_data=f"reject_{appointment.id}")
+        ])
+        caption = (f"🧾 Предоплата от {user.full_name}\nУслуга: {service.name}\n"
+                   f"Дата: {date_display} {slot.time}")
         try:
-            await bot.send_photo(admin_id, file_id, caption=f"🧾 Предоплата от {user.full_name}\nУслуга: {service.name}\nДата: {date_display} {slot.time}")
+            await bot.send_photo(admin_id, file_id, caption=caption, reply_markup=kb)
         except Exception as e:
             logging.error(f"Не удалось отправить скриншот админу {admin_id}: {e}")
     await state.clear()
     session.close()
 
-# ---------- ОБРАБОТКА КНОПОК ПОДТВЕРЖДЕНИЯ/ОТКЛОНЕНИЯ ----------
+# ---------- ПОДТВЕРЖДЕНИЕ/ОТКЛОНЕНИЕ ----------
 @dp.callback_query(F.data.startswith("confirm_"))
 async def confirm_appointment(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -518,7 +529,7 @@ async def reject_appointment(callback: types.CallbackQuery):
     await callback.answer("Запись отклонена")
     session.close()
 
-# ---------- АДМИН-ПАНЕЛЬ (полная реализация) ----------
+# ---------- АДМИН-ПАНЕЛЬ ----------
 # Добавление окон
 @dp.message(F.text == "➕ Добавить окна")
 async def add_slots_start(message: types.Message, state: FSMContext):
@@ -688,7 +699,7 @@ async def cancel_slot_edit(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Редактирование отменено.")
     await state.clear()
 
-# Управление услугами (полный блок)
+# Управление услугами
 @dp.message(F.text == "💼 Управление услугами")
 async def manage_services(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -758,20 +769,12 @@ async def add_service_duration(message: types.Message, state: FSMContext):
 async def add_service_prepayment(message: types.Message, state: FSMContext):
     answer = message.text.strip().lower()
     prepayment_required = answer in ["да", "yes", "1", "y"]
-    prepayment_amount = 0
     if prepayment_required:
         await message.answer("Введите сумму предоплаты (число):")
-        # Для простоты используем дополнительное состояние через вложенность
         await state.update_data(svc_prepayment_required=True)
-        await state.set_state(AdminStates.adding_service_prepayment)  # переиспользуем, но сейчас ожидаем сумму
-        # В этом состоянии мы не знаем, вводится ли сумма или ответ на вопрос, поэтому лучше новое состояние, но для сокращения кода допустим, что после "да" сразу вводится сумма.
-        # Реализуем через проверку: если предыдущее сообщение было "да", то теперь ожидаем сумму.
-        # Для корректности внесём отдельное состояние, но чтобы не усложнять, сделаем допущение.
-        # В реальном коде лучше использовать отдельное состояние, но для примера пропустим.
-        # Здесь мы не будем реализовывать ввод суммы, а предложим отредактировать после создания.
+        await state.set_state(AdminStates.adding_service_prepayment)  # временно
         prepayment_required = False
         await message.answer("Ввод суммы предоплаты пока не реализован. Услуга будет создана без предоплаты, вы сможете настроить её через редактирование.")
-    # Создаём услугу
     data = await state.get_data()
     session = SessionLocal()
     new_service = Service(
@@ -917,7 +920,7 @@ async def delete_service(callback: types.CallbackQuery, state: FSMContext):
     session.close()
     await state.clear()
 
-# Редактирование текстов (общее)
+# Редактирование текстов
 @dp.message(F.text.in_(["📝 Редактировать ЧаВо", "📩 Сообщение с реквизитами", "📨 Сообщение об успешной записи", "📍 Адрес (текст)", "💬 Текст консультации", "📢 Текст пожеланий"]))
 async def edit_text_start(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -1000,17 +1003,17 @@ async def save_client_notes(message: types.Message, state: FSMContext):
     session.close()
     await state.clear()
 
-# Удаление всех записей
+# Удаление всех окон
 @dp.message(F.text == "🗑 Удалить все записи")
 async def delete_all_appointments(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await message.answer("У вас нет прав.")
         return
     kb = inline_kb_3([
-        types.InlineKeyboardButton(text="✅ Да, удалить", callback_data="delall_yes"),
+        types.InlineKeyboardButton(text="✅ Да, удалить все окна", callback_data="delall_yes"),
         types.InlineKeyboardButton(text="❌ Отмена", callback_data="delall_no"),
     ])
-    await message.answer("Вы уверены, что хотите удалить ВСЕ записи и освободить окна?", reply_markup=kb)
+    await message.answer("Вы уверены, что хотите удалить ВСЕ ОКНА и связанные записи?", reply_markup=kb)
     await state.set_state(AdminStates.confirming_delete_all)
 
 @dp.callback_query(AdminStates.confirming_delete_all, F.data == "delall_yes")
@@ -1019,11 +1022,11 @@ async def delete_all_confirm(callback: types.CallbackQuery, state: FSMContext):
     session = SessionLocal()
     # Удаляем все записи
     session.query(Appointment).delete()
-    # Освобождаем все слоты
-    session.query(ScheduleSlot).update({"is_booked": False})
+    # Удаляем все слоты
+    session.query(ScheduleSlot).delete()
     session.commit()
     session.close()
-    await callback.message.edit_text("Все записи удалены, окна освобождены.")
+    await callback.message.edit_text("Все окна и записи удалены.")
     await state.clear()
 
 @dp.callback_query(AdminStates.confirming_delete_all, F.data == "delall_no")
@@ -1032,7 +1035,7 @@ async def delete_all_cancel(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Отменено.")
     await state.clear()
 
-# Просмотр записей (с кнопками)
+# Просмотр записей (кнопки)
 @dp.message(F.text == "📋 Все записи")
 async def show_appointments_admin(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -1073,10 +1076,8 @@ async def show_appointment_detail(callback: types.CallbackQuery):
             f"Телефон: {client.phone}\n"
             f"Услуга: {service.name}\n"
             f"Дата: {date_display} {slot.time}\n"
-            f"Статус: {app.status}\n"
             f"Пожелания: {app.client_notes or 'нет'}\n")
     if app.prepayment_screenshot:
-        # можно отправить фото отдельно
         await callback.message.answer(text)
         await callback.message.answer_photo(app.prepayment_screenshot)
     else:
@@ -1104,7 +1105,6 @@ async def show_clients(message: types.Message):
 # ---------- ЗАПУСК ----------
 async def main():
     session = SessionLocal()
-    # Настройки по умолчанию
     defaults = {
         'faq_text': "Часто задаваемые вопросы:\n\n❓ Как подготовиться?\n— Приходите без макияжа глаз.\n\n❓ Сколько держатся ресницы?\n— 2–4 недели.\n\n❓ Можно ли мочить глаза?\n— В первые 24 часа не рекомендуется.",
         'confirmation_text': "Для подтверждения записи необходимо внести предоплату {prepayment_amount} руб.\nПереведите на карту 1234 5678 9012 3456 и отправьте скриншот.",
