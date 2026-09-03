@@ -15,7 +15,7 @@ from aiohttp import web
 import os
 from dotenv import load_dotenv
 
-load_dotenv()  # для локального тестирования (если есть .env)
+load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
@@ -47,7 +47,7 @@ class Service(Base):
 class ScheduleSlot(Base):
     __tablename__ = 'schedule_slots'
     id = Column(Integer, primary_key=True)
-    date = Column(String)   # формат YYYY-MM-DD
+    date = Column(String)   # формат YYYY.MM.DD
     time = Column(String)   # формат HH:MM
     is_booked = Column(Boolean, default=False)
     appointment = relationship('Appointment', uselist=False, back_populates='slot')
@@ -64,6 +64,11 @@ class Appointment(Base):
     user = relationship('User', back_populates='appointments')
     service = relationship('Service')
     slot = relationship('ScheduleSlot', back_populates='appointment')
+
+class Setting(Base):
+    __tablename__ = 'settings'
+    key = Column(String, primary_key=True)
+    value = Column(String)
 
 engine = create_engine('sqlite:///bot.db', connect_args={"check_same_thread": False})
 Base.metadata.create_all(engine)
@@ -90,21 +95,25 @@ class AdminStates(StatesGroup):
     adding_slot_time = State()
 
     # Редактирование слотов
-    editing_slot_date = State()          # выбор даты
-    editing_slot_list = State()          # показ слотов (кнопки)
-    editing_slot_choose_action = State() # выбор действия: удалить/изменить время
-    editing_slot_new_time = State()      # ввод нового времени
+    editing_slot_list = State()
+    editing_slot_choose_action = State()
+    editing_slot_new_date = State()
+    editing_slot_new_time = State()
 
     # Управление услугами
-    managing_services = State()          # главное меню услуг
+    managing_services = State()
     adding_service_name = State()
     adding_service_description = State()
     adding_service_price = State()
     adding_service_duration = State()
-    adding_service_prepayment = State()  # флаг предоплаты и сумма
-    editing_service_select = State()     # выбор услуги для редактирования
-    editing_service_field = State()      # выбор поля
-    editing_service_value = State()      # ввод значения
+    adding_service_prepayment = State()
+    editing_service_select = State()
+    editing_service_field = State()
+    editing_service_value = State()
+
+    # Редактирование ЧаВо
+    managing_faq = State()
+    editing_faq_text = State()
 
 # ---------- КЛАВИАТУРЫ ----------
 def main_keyboard():
@@ -113,7 +122,7 @@ def main_keyboard():
             [types.KeyboardButton(text="📋 Услуги и цены")],
             [types.KeyboardButton(text="📅 Записаться")],
             [types.KeyboardButton(text="👤 Мои записи")],
-            [types.KeyboardButton(text="❓ FAQ")],
+            [types.KeyboardButton(text="❓ ЧаВо")],
         ],
         resize_keyboard=True
     )
@@ -124,6 +133,7 @@ def admin_keyboard():
             [types.KeyboardButton(text="➕ Добавить окна")],
             [types.KeyboardButton(text="📅 Редактировать окна")],
             [types.KeyboardButton(text="💼 Управление услугами")],
+            [types.KeyboardButton(text="📝 Редактировать ЧаВо")],
             [types.KeyboardButton(text="📋 Все записи")],
             [types.KeyboardButton(text="📊 Клиенты")],
         ],
@@ -140,6 +150,10 @@ def get_or_create_user(telegram_id, username, full_name):
         session.commit()
     session.close()
     return user
+
+def format_slot(slot):
+    status = "занято" if slot.is_booked else "свободно"
+    return f"{slot.date} {slot.time} ({status})"
 
 # ---------- ВЕБ-СЕРВЕР ДЛЯ RENDER ----------
 async def run_web_server():
@@ -206,14 +220,15 @@ async def show_services(message: types.Message):
     await message.answer(text)
     session.close()
 
-@dp.message(F.text == "❓ FAQ")
+@dp.message(F.text == "❓ ЧаВо")
 async def show_faq(message: types.Message):
-    await message.answer(
-        "Частые вопросы:\n\n"
-        "❓ Как подготовиться?\n— Приходите без макияжа глаз.\n\n"
-        "❓ Сколько держатся ресницы?\n— 2–4 недели.\n\n"
-        "❓ Можно ли мочить глаза?\n— В первые 24 часа не рекомендуется."
-    )
+    session = SessionLocal()
+    faq = session.query(Setting).filter(Setting.key == 'faq_text').first()
+    session.close()
+    if faq:
+        await message.answer(faq.value)
+    else:
+        await message.answer("Раздел пока не заполнен.")
 
 @dp.message(F.text == "👤 Мои записи")
 async def show_my_appointments(message: types.Message):
@@ -356,16 +371,16 @@ async def add_slots_start(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await message.answer("У вас нет прав.")
         return
-    await message.answer("Введите дату в формате ГГГГ-ММ-ДД (например, 2025-05-20):")
+    await message.answer("Введите дату в формате ГГГГ.ММ.ДД (например, 2025.05.20):")
     await state.set_state(AdminStates.adding_slot_date)
 
 @dp.message(AdminStates.adding_slot_date)
 async def add_slot_date(message: types.Message, state: FSMContext):
     date_text = message.text.strip()
     try:
-        datetime.strptime(date_text, "%Y-%m-%d")
+        datetime.strptime(date_text, "%Y.%m.%d")
     except ValueError:
-        await message.answer("Неверный формат. Введите ещё раз:")
+        await message.answer("Неверный формат даты. Введите ещё раз (ГГГГ.ММ.ДД):")
         return
     await state.update_data(date=date_text)
     await message.answer("Теперь введите время через запятую (например: 10:00, 11:30, 15:00):")
@@ -382,7 +397,7 @@ async def add_slot_time(message: types.Message, state: FSMContext):
         session.add(slot)
     session.commit()
     session.close()
-    await message.answer(f"Добавлено окон: {len(times)} на {date}")
+    await message.answer("Готово!")
     await state.clear()
 
 # ---------- РЕДАКТИРОВАНИЕ ОКОН ----------
@@ -391,32 +406,18 @@ async def edit_slots_start(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await message.answer("У вас нет прав.")
         return
-    await message.answer("Введите дату для просмотра окон (ГГГГ-ММ-ДД):")
-    await state.set_state(AdminStates.editing_slot_date)
-
-@dp.message(AdminStates.editing_slot_date)
-async def edit_slot_date(message: types.Message, state: FSMContext):
-    date_text = message.text.strip()
-    try:
-        datetime.strptime(date_text, "%Y-%m-%d")
-    except ValueError:
-        await message.answer("Неверный формат. Введите ещё раз:")
-        return
     session = SessionLocal()
-    slots = session.query(ScheduleSlot).filter(ScheduleSlot.date == date_text).order_by(ScheduleSlot.time).all()
+    slots = session.query(ScheduleSlot).order_by(ScheduleSlot.date, ScheduleSlot.time).all()
+    session.close()
     if not slots:
-        await message.answer("На эту дату нет окон.")
-        session.close()
-        await state.clear()
+        await message.answer("Нет ни одного окна.")
         return
-    await state.update_data(edit_date=date_text)
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text=f"{slot.time} (занято: {slot.is_booked})", callback_data=f"editslot_{slot.id}")]
+        [types.InlineKeyboardButton(text=format_slot(slot), callback_data=f"editslot_{slot.id}")]
         for slot in slots
     ])
-    await message.answer("Выберите слот для редактирования:", reply_markup=keyboard)
+    await message.answer("Список окон (нажмите для редактирования):", reply_markup=keyboard)
     await state.set_state(AdminStates.editing_slot_list)
-    session.close()
 
 @dp.callback_query(AdminStates.editing_slot_list, F.data.startswith("editslot_"))
 async def edit_slot_selected(callback: types.CallbackQuery, state: FSMContext):
@@ -427,35 +428,47 @@ async def edit_slot_selected(callback: types.CallbackQuery, state: FSMContext):
     slot = session.query(ScheduleSlot).get(slot_id)
     session.close()
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="🗑 Удалить слот", callback_data="action_delete")],
+        [types.InlineKeyboardButton(text="📅 Изменить дату", callback_data="action_changedate")],
         [types.InlineKeyboardButton(text="🕒 Изменить время", callback_data="action_changetime")],
+        [types.InlineKeyboardButton(text="🗑 Удалить слот", callback_data="action_delete")],
         [types.InlineKeyboardButton(text="Отмена", callback_data="action_cancel")]
     ])
-    await callback.message.edit_text(f"Слот: {slot.date} {slot.time}\nЧто сделать?", reply_markup=keyboard)
+    await callback.message.edit_text(f"Слот: {slot.date} {slot.time}\nВыберите действие:", reply_markup=keyboard)
     await state.set_state(AdminStates.editing_slot_choose_action)
 
-@dp.callback_query(AdminStates.editing_slot_choose_action, F.data == "action_delete")
-async def delete_slot(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(AdminStates.editing_slot_choose_action, F.data == "action_changedate")
+async def change_slot_date_prompt(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
+    await callback.message.answer("Введите новую дату в формате ГГГГ.ММ.ДД (например, 2025.06.01):")
+    await state.set_state(AdminStates.editing_slot_new_date)
+
+@dp.message(AdminStates.editing_slot_new_date)
+async def change_slot_date(message: types.Message, state: FSMContext):
+    new_date = message.text.strip()
+    try:
+        datetime.strptime(new_date, "%Y.%m.%d")
+    except ValueError:
+        await message.answer("Неверный формат даты. Введите ещё раз (ГГГГ.ММ.ДД):")
+        return
     data = await state.get_data()
     slot_id = data['editing_slot_id']
     session = SessionLocal()
     slot = session.query(ScheduleSlot).get(slot_id)
-    if slot and slot.is_booked:
-        await callback.message.answer("Нельзя удалить забронированный слот.")
+    if not slot:
+        await message.answer("Слот не найден.")
         session.close()
         await state.clear()
         return
-    session.delete(slot)
+    slot.date = new_date
     session.commit()
     session.close()
-    await callback.message.edit_text("Слот удалён.")
+    await message.answer("Готово!")
     await state.clear()
 
 @dp.callback_query(AdminStates.editing_slot_choose_action, F.data == "action_changetime")
 async def change_slot_time_prompt(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.answer("Введите новое время для слота в формате ЧЧ:ММ (например, 12:00):")
+    await callback.message.answer("Введите новое время в формате ЧЧ:ММ (например, 12:00):")
     await state.set_state(AdminStates.editing_slot_new_time)
 
 @dp.message(AdminStates.editing_slot_new_time)
@@ -478,7 +491,28 @@ async def change_slot_time(message: types.Message, state: FSMContext):
     slot.time = new_time
     session.commit()
     session.close()
-    await message.answer(f"Время слота обновлено на {new_time}.")
+    await message.answer("Готово!")
+    await state.clear()
+
+@dp.callback_query(AdminStates.editing_slot_choose_action, F.data == "action_delete")
+async def delete_slot(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    slot_id = data['editing_slot_id']
+    session = SessionLocal()
+    slot = session.query(ScheduleSlot).get(slot_id)
+    if slot and slot.is_booked:
+        await callback.message.answer("Нельзя удалить забронированный слот.")
+        session.close()
+        await state.clear()
+        return
+    if slot:
+        session.delete(slot)
+        session.commit()
+        await callback.message.edit_text("Готово!")
+    else:
+        await callback.message.edit_text("Слот не найден.")
+    session.close()
     await state.clear()
 
 @dp.callback_query(AdminStates.editing_slot_choose_action, F.data == "action_cancel")
@@ -558,23 +592,14 @@ async def add_service_duration(message: types.Message, state: FSMContext):
 async def add_service_prepayment(message: types.Message, state: FSMContext):
     answer = message.text.strip().lower()
     prepayment_required = answer in ["да", "yes", "1", "y"]
-    prepayment_amount = 0
     if prepayment_required:
         await message.answer("Введите сумму предоплаты (число):")
         await state.update_data(svc_prepayment_required=True)
-        # Используем то же состояние для ввода суммы
+        # Используем то же состояние для ввода суммы, но лучше отдельное
         await state.set_state(AdminStates.adding_service_prepayment)  # временно
-        # Лучше ввести отдельное состояние, но для простоты обработаем в этом же через распознавание
-        # На практике нужно новое состояние, поэтому здесь будет небольшая хитрость: если уже есть флаг, то это ввод суммы
-        # В реальном коде лучше использовать дополнительное состояние, но мы обойдёмся упрощённо:
-        # Если установлен флаг, то следующее сообщение будет суммой, но нам нужно отличать от первого ввода
-        # Добавим проверку: если сообщение не "да"/"нет", то это сумма
-        # Но пользователь может случайно ввести что-то другое, поэтому для примера оставим как есть,
-        # но в рабочем коде лучше сделать отдельное состояние. В этом примере мы завершим добавление без предоплаты.
-        # Для простоты будем считать, что если пользователь отвечает "да", то мы сразу устанавливаем предоплату равной 500 (по умолчанию) и завершаем.
-        # Но это не совсем правильно. Поэтому я не буду реализовывать ввод суммы в этом коде, а оставлю предоплату только через редактирование.
-        # Поэтому просто игнорируем запрос суммы и создаём услугу с предоплатой 0, а потом админ может отредактировать.
-        # Так будет проще.
+        # Для простоты допустим, что пользователь введёт сумму
+        # Но мы не будем реализовывать ввод суммы в этом состоянии,
+        # а завершим создание без предоплаты и попросим настроить через редактирование
         prepayment_required = False
         await message.answer("Ввод суммы предоплаты пока не реализован. Услуга будет создана без предоплаты, вы сможете настроить её через редактирование.")
     # Сохраняем услугу
@@ -591,7 +616,7 @@ async def add_service_prepayment(message: types.Message, state: FSMContext):
     session.add(new_service)
     session.commit()
     session.close()
-    await message.answer("Услуга добавлена!")
+    await message.answer("Готово!")
     await state.clear()
 
 # Редактирование услуги
@@ -691,7 +716,7 @@ async def edit_service_value(message: types.Message, state: FSMContext):
             return
     session.commit()
     session.close()
-    await message.answer("Поле обновлено.")
+    await message.answer("Готово!")
     await state.clear()
 
 # Удаление услуги
@@ -721,10 +746,52 @@ async def delete_service(callback: types.CallbackQuery, state: FSMContext):
     if service:
         session.delete(service)
         session.commit()
-        await callback.message.answer("Услуга удалена.")
+        await callback.message.answer("Готово!")
     else:
         await callback.message.answer("Услуга не найдена.")
     session.close()
+    await state.clear()
+
+# ---------- РЕДАКТИРОВАНИЕ ЧАВО ----------
+@dp.message(F.text == "📝 Редактировать ЧаВо")
+async def edit_faq_start(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="✏️ Редактировать", callback_data="faq_edit")],
+        [types.InlineKeyboardButton(text="❌ Отмена", callback_data="faq_cancel")],
+    ])
+    await message.answer("Выберите действие:", reply_markup=keyboard)
+    await state.set_state(AdminStates.managing_faq)
+
+@dp.callback_query(AdminStates.managing_faq, F.data == "faq_edit")
+async def faq_edit_prompt(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.answer("Введите новый текст ЧаВо:")
+    await state.set_state(AdminStates.editing_faq_text)
+
+@dp.callback_query(AdminStates.managing_faq, F.data == "faq_cancel")
+async def faq_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.edit_text("Отменено.")
+    await state.clear()
+
+@dp.message(AdminStates.editing_faq_text)
+async def faq_save(message: types.Message, state: FSMContext):
+    new_text = message.text.strip()
+    if not new_text:
+        await message.answer("Текст не может быть пустым. Попробуйте ещё раз:")
+        return
+    session = SessionLocal()
+    setting = session.query(Setting).filter(Setting.key == 'faq_text').first()
+    if setting:
+        setting.value = new_text
+    else:
+        session.add(Setting(key='faq_text', value=new_text))
+    session.commit()
+    session.close()
+    await message.answer("Готово!")
     await state.clear()
 
 # ---------- ПРОСМОТР ЗАПИСЕЙ ----------
@@ -737,8 +804,8 @@ async def show_all_appointments(message: types.Message):
     today = datetime.now().date()
     end_date = today + timedelta(days=7)
     appointments = session.query(Appointment).join(ScheduleSlot).filter(
-        ScheduleSlot.date >= today.strftime("%Y-%m-%d"),
-        ScheduleSlot.date <= end_date.strftime("%Y-%m-%d")
+        ScheduleSlot.date >= today.strftime("%Y.%m.%d"),
+        ScheduleSlot.date <= end_date.strftime("%Y.%m.%d")
     ).all()
     if not appointments:
         await message.answer("На ближайшую неделю записей нет.")
@@ -773,8 +840,16 @@ async def show_clients(message: types.Message):
 
 # ---------- ЗАПУСК ----------
 async def main():
-    # Добавим тестовые услуги, если база пустая (опционально)
     session = SessionLocal()
+    if session.query(Setting).filter(Setting.key == 'faq_text').first() is None:
+        default_faq = (
+            "Часто задаваемые вопросы:\n\n"
+            "❓ Как подготовиться?\n— Приходите без макияжа глаз.\n\n"
+            "❓ Сколько держатся ресницы?\n— 2–4 недели.\n\n"
+            "❓ Можно ли мочить глаза?\n— В первые 24 часа не рекомендуется."
+        )
+        session.add(Setting(key='faq_text', value=default_faq))
+        session.commit()
     if session.query(Service).count() == 0:
         services = [
             Service(name="Классическое наращивание", price=2500, duration_minutes=120, prepayment_required=True, prepayment_amount=500),
@@ -785,7 +860,6 @@ async def main():
         session.commit()
     session.close()
 
-    # Запускаем веб-сервер и поллинг параллельно
     await asyncio.gather(
         run_web_server(),
         dp.start_polling(bot)
